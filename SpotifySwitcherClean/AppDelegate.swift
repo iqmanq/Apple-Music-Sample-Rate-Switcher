@@ -16,6 +16,7 @@ struct CurrentlyPlayingTrack {
     let uri: String
 }
 
+// NOTE: SpotifyTrack is now Codable to allow for local storage
 struct SpotifyTrack: Codable, Equatable, Hashable {
     var id: String
     var title: String
@@ -121,6 +122,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastNowPlayingImage: NSImage?
     private var internalCurrentPlaybackState: PlaybackState = .loading
     private var dataUpdateTimer: Timer?
+    private var lastSeenTrackURI: String? // Used for local history tracking
     
     // Identifiers for dynamic menu items
     private let historyMenuItemIdentifier = NSUserInterfaceItemIdentifier("historyMenuItem")
@@ -139,6 +141,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         setupMenu()
+        
+        // Load locally stored data on launch
+        loadRecentTracks()
+        updateHistoryMenu(excluding: nil)
         
         if let storedDevice = SpotifyDeviceStore.load() {
             self.preferredDevice = storedDevice
@@ -502,6 +508,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 
                 let track = CurrentlyPlayingTrack(id: id, name: name, artist: artistNames, artworkURL: artworkURL, uri: uri)
                 
+                let newSpotifyTrack = SpotifyTrack(
+                    id: track.id,
+                    title: track.name,
+                    artistName: track.artist,
+                    isLiked: false, // Placeholder, will be updated below
+                    uri: track.uri,
+                    artworkURL: track.artworkURL
+                )
+                
                 let group = DispatchGroup()
                 var isLiked: Bool = false
                 var albumArtImage: NSImage? = nil
@@ -521,6 +536,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 
                 group.notify(queue: .main) {
+                    
+                    // --- FIX IS HERE ---
+                    // We no longer use 'if let' because track.uri is not optional.
+                    let newTrackURI = track.uri
+                    if newTrackURI != self.lastSeenTrackURI {
+                    // --- END FIX ---
+                    
+                        NSLog("🎶 New track detected: \(track.name). Adding to local history.")
+
+                        var trackToAdd = newSpotifyTrack
+                        trackToAdd.isLiked = isLiked // Assign the correct liked status
+
+                        self.recentTracks.removeAll { $0.uri == trackToAdd.uri }
+                        self.recentTracks.insert(trackToAdd, at: 0)
+                        if self.recentTracks.count > 20 {
+                            self.recentTracks = Array(self.recentTracks.prefix(20))
+                        }
+
+                        self.saveRecentTracks()
+                        self.lastSeenTrackURI = newTrackURI
+                        
+                    } else if let index = self.recentTracks.firstIndex(where: { $0.id == track.id }) {
+                        self.recentTracks[index].isLiked = isLiked
+                    }
+                    
                     self.updateUI(for: .playing(track: track, isActuallyPlaying: isActuallyPlaying, isLiked: isLiked, art: albumArtImage))
                 }
                 
@@ -530,7 +570,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }.resume()
     }
-    
     func fetchRecentlyPlayed() {
         guard let token = tokenStore, !token.isExpired else { return }
 
@@ -545,6 +584,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
              return
         }
         var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData // Good practice to keep this
         request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -555,26 +595,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             
-            guard let httpResponse = response as? HTTPURLResponse else {
-                NSLog("❌ [fetchRecentlyPlayed] Invalid response type.")
-                return
-            }
-
-            NSLog("ℹ️ [fetchRecentlyPlayed] HTTP Status Code: \(httpResponse.statusCode)")
-            if let contentType = httpResponse.allHeaderFields["Content-Type"] as? String {
-                NSLog("ℹ️ [fetchRecentlyPlayed] Content-Type: \(contentType)")
-            } else if let contentType = httpResponse.allHeaderFields["content-type"] as? String {
-                 NSLog("ℹ️ [fetchRecentlyPlayed] Content-Type (lowercase): \(contentType)")
-            } else {
-                NSLog("⚠️ [fetchRecentlyPlayed] Content-Type header not found or not a string.")
-            }
-
-
-            guard (200...299).contains(httpResponse.statusCode) else {
-                NSLog("❌ [fetchRecentlyPlayed] HTTP Error: \(httpResponse.statusCode)")
-                if let responseData = data, let errorString = String(data: responseData, encoding: .utf8) {
-                    NSLog("❌ [fetchRecentlyPlayed] HTTP Error Body: \(errorString)")
-                }
+            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                NSLog("❌ [fetchRecentlyPlayed] HTTP Error: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
                 return
             }
             
@@ -583,36 +605,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             
-            if let rawResponseString = String(data: data, encoding: .utf8) {
-                NSLog("ℹ️ [fetchRecentlyPlayed] Raw data string (length: \(data.count)):\n\(rawResponseString)")
-            } else {
-                NSLog("⚠️ [fetchRecentlyPlayed] Could not convert data to UTF-8 string for logging. Data length: \(data.count)")
-            }
-
             do {
-                NSLog("ℹ️ [fetchRecentlyPlayed] Attempting JSONSerialization.jsonObject...")
-                let parsedJSON = try JSONSerialization.jsonObject(with: data, options: [])
-                NSLog("✅ [fetchRecentlyPlayed] JSONSerialization.jsonObject SUCCEEDED. Parsed type: \(type(of: parsedJSON))")
-
-
-                guard let json = parsedJSON as? [String: Any],
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let items = json["items"] as? [[String: Any]] else {
-                    NSLog("❌ [fetchRecentlyPlayed] Parsed JSON structure is not [String: Any] with 'items' as [[String: Any]].")
-                    if let parsedJson = try? JSONSerialization.jsonObject(with: data, options: []) {
-                        NSLog("ℹ️ [fetchRecentlyPlayed] Actually parsed JSON type: \(type(of: parsedJson))")
-                    }
+                    NSLog("❌ [fetchRecentlyPlayed] Could not parse recently played items.")
                     return
                 }
                 
-                NSLog("✅ [fetchRecentlyPlayed] Successfully parsed items. Count: \(items.count)")
-
                 var parsedTracks: [SpotifyTrack] = []
                 for item in items {
                     guard let trackData = item["track"] as? [String: Any],
                           let name = trackData["name"] as? String,
                           let uri = trackData["uri"] as? String,
                           let trackIdFromApi = trackData["id"] as? String else {
-                        NSLog("⚠️ [fetchRecentlyPlayed] Skipping item due to missing data.")
                         continue
                     }
                     
@@ -621,45 +626,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                     let albumData = trackData["album"] as? [String: Any]
                     let imagesData = albumData?["images"] as? [[String: Any]]
-                    var artworkURL: String? = nil
-                    if let firstImage = imagesData?.first, let url = firstImage["url"] as? String {
-                        artworkURL = url
-                    }
+                    let artworkURL = imagesData?.first?["url"] as? String
                     
                     parsedTracks.append(SpotifyTrack(id: trackIdFromApi, title: name, artistName: artistName, isLiked: false, uri: uri, artworkURL: artworkURL))
                 }
+                
+                // --- MERGE LOGIC ---
+                // Start with our local tracks, which are the most up-to-date for this session.
+                var mergedTracks = self.recentTracks
+                let localURIs = Set(self.recentTracks.map { $0.uri })
 
-                var uniqueTracks: [SpotifyTrack] = []
+                // Add tracks from the API that we don't already have in our local list.
+                for apiTrack in parsedTracks {
+                    if !localURIs.contains(apiTrack.uri) {
+                        mergedTracks.append(apiTrack)
+                    }
+                }
+                
+                // Ensure the final list is unique and limited.
+                var uniqueMergedTracks: [SpotifyTrack] = []
                 var seenURIs = Set<String>()
-                for track in parsedTracks {
+                for track in mergedTracks {
                     if !seenURIs.contains(track.uri) {
-                        uniqueTracks.append(track)
+                        uniqueMergedTracks.append(track)
                         seenURIs.insert(track.uri)
                     }
                 }
-                var top10Tracks = Array(uniqueTracks.prefix(10))
+                // We'll operate on the top 10 for the menu display.
+                var top10Tracks = Array(uniqueMergedTracks.prefix(10))
 
                 let group = DispatchGroup()
                 for i in 0..<top10Tracks.count {
                     group.enter()
-                    
-                    let idForLikedCheck = top10Tracks[i].id
-
-                    if !idForLikedCheck.isEmpty {
-                        self.checkIfTrackIsLiked(trackId: idForLikedCheck, accessToken: token.accessToken) { isLikedStatus in
-                            if i < top10Tracks.count {
-                                top10Tracks[i].isLiked = isLikedStatus
-                            }
-                            group.leave()
+                    self.checkIfTrackIsLiked(trackId: top10Tracks[i].id, accessToken: token.accessToken) { isLikedStatus in
+                        if i < top10Tracks.count {
+                            top10Tracks[i].isLiked = isLikedStatus
                         }
-                    } else {
-                        NSLog("⚠️ [fetchRecentlyPlayed] Track ID was empty for URI: \(top10Tracks[i].uri) for liked status check.")
                         group.leave()
                     }
                 }
 
                 group.notify(queue: .main) {
+                    // Update our main list with the merged and checked list.
                     self.recentTracks = top10Tracks
+                    self.saveRecentTracks() // Save the newly merged list.
                     
                     var currentPlayingURI: String? = nil
                     if case .playing(let currentTrack, _, _, _) = self.internalCurrentPlaybackState {
@@ -669,10 +679,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 
             } catch let serializationError {
-                NSLog("❌ [fetchRecentlyPlayed] JSONSerialization.jsonObject FAILED. Error: \(serializationError.localizedDescription)")
-                NSLog("❌ [fetchRecentlyPlayed] Error details: \(serializationError)")
+                NSLog("❌ [fetchRecentlyPlayed] JSONSerialization error: \(serializationError)")
             }
         }.resume()
+    }
+
+    // MARK: - Local Track Storage
+    
+    func getRecentTracksFileURL() -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("SpotifyMenubarApp", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
+        }
+        return dir.appendingPathComponent("spotify_recent_tracks.json")
+    }
+
+    func saveRecentTracks() {
+        let fileURL = getRecentTracksFileURL()
+        do {
+            // Limit to saving the most recent 20 tracks to keep the file size reasonable
+            let tracksToSave = Array(self.recentTracks.prefix(20))
+            let data = try JSONEncoder().encode(tracksToSave)
+            try data.write(to: fileURL, options: .atomicWrite)
+            NSLog("💾 Recent tracks saved to \(fileURL.path)")
+        } catch {
+            NSLog("❌ Failed to save recent tracks: \(error.localizedDescription)")
+        }
+    }
+
+    func loadRecentTracks() {
+        let fileURL = getRecentTracksFileURL()
+        guard let data = try? Data(contentsOf: fileURL) else {
+            NSLog("ℹ️ No recent tracks file found at \(fileURL.path)")
+            return
+        }
+        do {
+            self.recentTracks = try JSONDecoder().decode([SpotifyTrack].self, from: data)
+            NSLog("✅ Recent tracks loaded from \(fileURL.path)")
+        } catch {
+            NSLog("❌ Failed to decode recent tracks from file: \(error.localizedDescription).")
+        }
     }
 
 
@@ -682,9 +729,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let redirectURI = "spotify-menubar-app://callback"
         let scope = "user-read-playback-state user-read-currently-playing user-library-read user-library-modify playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-modify-playback-state user-read-recently-played"
 
+        // Generate and store the verifier
         self.codeVerifier = PKCE.generateCodeVerifier()
-        guard let codeChallenge = PKCE.codeChallenge(for: self.codeVerifier!) else {
-            NSLog("❌ Failed to generate code challenge.")
+
+        // Use a guard to safely unwrap the verifier and generate the challenge
+        guard let verifier = self.codeVerifier,
+              let challenge = PKCE.codeChallenge(for: verifier) else {
+            NSLog("❌ Failed to generate PKCE code challenge.")
             return
         }
 
@@ -694,7 +745,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "redirect_uri", value: redirectURI),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "code_challenge", value: codeChallenge),
+            URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "scope", value: scope),
             URLQueryItem(name: "state", value: UUID().uuidString)
         ]
@@ -705,7 +756,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(url)
         NSLog("🔑 Opened Spotify authorization URL in browser.")
     }
-
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first,
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -725,6 +775,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let clientId = "c62a858a7ec0468194da1c197d3c4d3d"
         let redirectURI = "spotify-menubar-app://callback"
+        
+        // This should now work correctly.
         guard let verifier = self.codeVerifier else {
             NSLog("❌ Code verifier missing for token exchange.")
             return
@@ -759,7 +811,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }.resume()
     }
-
     func refreshAccessToken() {
         guard let currentTokenStore = tokenStore, let refreshToken = currentTokenStore.refreshToken else {
             NSLog("❌ No refresh token available. User needs to re-authorize.")
@@ -831,6 +882,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func resetAuthorization() {
         SpotifyTokenStore.delete()
         SpotifyDeviceStore.delete()
+        // Delete the new recent tracks file
+        try? FileManager.default.removeItem(at: getRecentTracksFileURL())
+        
         self.tokenStore = nil
         self.preferredDevice = nil
         self.recentTracks = []
@@ -840,7 +894,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.updateUI(for: .notPlaying(message: "Please click to authorize"))
             self.updateHistoryMenu(excluding: nil)
         }
-        NSLog("🗑 Authorization and device reset by user. In-memory history cleared.")
+        NSLog("🗑 Authorization, device, and local history reset by user.")
     }
 
     @objc func quitApp() { NSApp.terminate(nil) }
@@ -892,25 +946,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 completion(false); return
             }
             guard let data = data,
-                  let httpResponse = response as? HTTPURLResponse else {
-                NSLog("❌ Invalid response or no data when checking liked status for track ID \(trackId).")
-                completion(false); return
-            }
-            
-            guard httpResponse.statusCode == 200 else {
-                NSLog("❌ Non-200 response when checking liked status for track ID \(trackId). Status: \(httpResponse.statusCode)")
-                if let errorBody = String(data: data, encoding: .utf8) {
-                    NSLog("❌ Error body for liked status check: \(errorBody)")
-                }
+                  let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                NSLog("❌ Invalid response or non-200 status when checking liked status for track ID \(trackId).")
                 completion(false); return
             }
             
             guard let result = try? JSONSerialization.jsonObject(with: data) as? [Bool],
                   let isLiked = result.first else {
                 NSLog("❌ Could not parse liked status JSON for track ID \(trackId).")
-                if let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("ℹ️ Raw JSON response for liked status (parsing failed): \(responseString)")
-                }
                 completion(false); return
             }
             completion(isLiked)
@@ -919,21 +962,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleLikeStatus() {
         guard let currentToken = tokenStore, !currentToken.isExpired else {
-            NSLog("ℹ️ Not authorized (token missing/expired) to toggle like.")
             self.updateAllData()
             return
         }
         
         guard case .playing(let track, _, _, _) = self.internalCurrentPlaybackState else {
-            NSLog("ℹ️ No track playing/paused to toggle like.")
             return
         }
 
         let trackID = track.id
-        NSLog("👍 Track is loaded: \(track.name) (ID: \(trackID)). Proceeding to check liked status.")
-
         checkIfTrackIsLiked(trackId: trackID, accessToken: currentToken.accessToken) { isCurrentlyLiked in
-            NSLog("❓ Track \(trackID) is currently liked: \(isCurrentlyLiked). Attempting to set to \(!isCurrentlyLiked).")
             let method = isCurrentlyLiked ? "DELETE" : "PUT"
             var likeRequest = URLRequest(url: URL(string: "https://api.spotify.com/v1/me/tracks?ids=\(trackID)")!)
             
@@ -945,10 +983,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             likeRequest.httpBody = try? JSONSerialization.data(withJSONObject: bodyParams)
             
             URLSession.shared.dataTask(with: likeRequest) { _, response, error in
-                if let error = error {
-                    NSLog("❌ Error toggling like status for track \(trackID): \(error.localizedDescription)")
-                } else if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
-                    NSLog("✅ Like status toggled successfully for track \(trackID). New state: \(!isCurrentlyLiked)")
+                if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
+                    NSLog("✅ Like status toggled successfully for track \(trackID).")
                 } else {
                     NSLog("❌ Failed to toggle like status for track \(trackID). Code: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
                 }
@@ -986,13 +1022,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
-                NSLog("❌ Failed to fetch playlists: \(error.localizedDescription)")
                 self.updatePlaylistsSubmenu(with: .failure(error))
                 return
             }
             guard let data = data,
                   let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                let fetchError = NSError(domain: "SpotifyApp", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch playlists. Status: \((response as? HTTPURLResponse)?.statusCode ?? 0)"])
+                let fetchError = NSError(domain: "SpotifyApp", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch playlists."])
                 self.updatePlaylistsSubmenu(with: .failure(fetchError))
                 return
             }
@@ -1010,7 +1045,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updatePlaylistsSubmenu(with: .failure(parseError))
                 }
             } catch {
-                NSLog("❌ Error parsing playlists JSON: \(error.localizedDescription)")
                 self.updatePlaylistsSubmenu(with: .failure(error))
             }
         }.resume()
@@ -1043,7 +1077,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     @objc func addCurrentSongToSelectedPlaylist(_ sender: NSMenuItem) {
         guard let playlistId = sender.representedObject as? String else {
-            NSLog("❌ Playlist ID not found for adding song.")
             showErrorAlert(title: "Error", message: "Could not identify the selected playlist.")
             return
         }
@@ -1054,12 +1087,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         guard case .playing(let track, _, _, _) = self.internalCurrentPlaybackState else {
             showErrorAlert(title: "Error Adding Song", message: "No song is currently playing or paused.")
-            NSLog("ℹ️ No track loaded to add to playlist. Current state: \(self.internalCurrentPlaybackState)")
             return
         }
         let trackURI = track.uri
-
-        NSLog("🎵 Adding track URI \(trackURI) to playlist \(playlistId)")
         
         var request = URLRequest(url: URL(string: "https://api.spotify.com/v1/playlists/\(playlistId)/tracks")!)
         request.httpMethod = "POST"
@@ -1070,24 +1100,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async {
-                if let error = error {
-                    self.showErrorAlert(title: "Error Adding Song", message: "Network error: \(error.localizedDescription)")
-                    return
-                }
-                if let httpResponse = response as? HTTPURLResponse {
-                    if httpResponse.statusCode == 201 {
-                        self.showSuccessAlert(title: "Song Added", message: "Successfully added '\(track.name)' to playlist '\(sender.title)'.")
-                    } else {
-                        var errorMessage = "Failed to add song. Status: \(httpResponse.statusCode)"
-                        if let responseData = data,
-                           let jsonError = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-                           let errorObj = jsonError["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                            errorMessage = msg
-                        }
-                        self.showErrorAlert(title: "Error Adding Song", message: errorMessage)
-                    }
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 201 {
+                    self.showSuccessAlert(title: "Song Added", message: "Successfully added '\(track.name)' to playlist '\(sender.title)'.")
                 } else {
-                     self.showErrorAlert(title: "Error Adding Song", message: "Invalid response from server.")
+                    self.showErrorAlert(title: "Error Adding Song", message: "Failed to add song.")
                 }
             }
         }.resume()
@@ -1105,20 +1121,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async {
-                if let error = error {
-                    self.showErrorAlert(title: "Device Error", message: "Could not fetch devices: \(error.localizedDescription)")
-                    return
-                }
                 guard let data = data,
                       let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let devices = json["devices"] as? [[String: Any]] else {
-                    self.showErrorAlert(title: "Device Error", message: "Could not parse device list. Status: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+                    self.showErrorAlert(title: "Device Error", message: "Could not parse device list.")
                     return
                 }
 
                 if devices.isEmpty {
-                    self.showErrorAlert(title: "No Devices", message: "No active Spotify devices found. Make sure Spotify is open on a device.")
+                    self.showErrorAlert(title: "No Devices", message: "No active Spotify devices found.")
                     return
                 }
 
@@ -1139,24 +1151,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 if alert.runModal() == .alertFirstButtonReturn {
                     if let selectedItem = popup.selectedItem, let deviceId = selectedItem.representedObject as? String {
-                        self.transferPlaybackToSelectedDevice(deviceId: deviceId, deviceName: selectedItem.title, play: true) { success in
-                            if success {
-                                let deviceToSave = SpotifyDeviceStore(id: deviceId, name: selectedItem.title)
-                                deviceToSave.save()
-                                self.preferredDevice = deviceToSave
-                                NSLog("🔊 Preferred device updated to: \(selectedItem.title)")
-                            }
-                        }
+                        self.transferPlaybackToSelectedDevice(deviceId: deviceId, deviceName: selectedItem.title, play: true)
                     }
                 }
             }
         }.resume()
     }
 
-    func transferPlaybackToSelectedDevice(deviceId: String, deviceName: String, play: Bool, completion: ((Bool) -> Void)? = nil) {
+    func transferPlaybackToSelectedDevice(deviceId: String, deviceName: String, play: Bool) {
         guard let token = tokenStore, !token.isExpired else {
             showErrorAlert(title: "Authorization Error", message: "Please authorize the app first.")
-            completion?(false)
             return
         }
 
@@ -1168,32 +1172,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let body: [String: Any] = ["device_ids": [deviceId], "play": play]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { _, response, error in
             DispatchQueue.main.async {
-                if let error = error {
-                    self.showErrorAlert(title: "Transfer Error", message: "Could not transfer playback: \(error.localizedDescription)")
-                    completion?(false)
-                    return
-                }
-                if let httpResponse = response as? HTTPURLResponse {
-                    if httpResponse.statusCode == 204 {
-                        NSLog("✅ Playback transferred successfully to \(deviceName).")
-                        self.showSuccessAlert(title: "Playback Transferred", message: "Playback transferred to \(deviceName).")
-                        self.updateAllData()
-                        completion?(true)
-                    } else {
-                        var errorMessage = "Transfer failed. Status: \(httpResponse.statusCode)"
-                         if let responseData = data,
-                           let jsonError = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-                           let errorObj = jsonError["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                            errorMessage += "\nDetails: \(msg)"
-                        }
-                        self.showErrorAlert(title: "Transfer Failed", message: errorMessage)
-                        completion?(false)
-                    }
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 204 {
+                    NSLog("✅ Playback transferred successfully to \(deviceName).")
+                    self.showSuccessAlert(title: "Playback Transferred", message: "Playback transferred to \(deviceName).")
+                    
+                    let deviceToSave = SpotifyDeviceStore(id: deviceId, name: deviceName)
+                    deviceToSave.save()
+                    self.preferredDevice = deviceToSave
+                    
+                    self.updateAllData()
                 } else {
-                    self.showErrorAlert(title: "Transfer Error", message: "Invalid response from server.")
-                    completion?(false)
+                    self.showErrorAlert(title: "Transfer Failed", message: "Could not transfer playback.")
                 }
             }
         }.resume()
@@ -1230,9 +1221,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 // MARK: - PKCE (Proof Key for Code Exchange) Helper
 struct PKCE {
-    static func generateCodeVerifier() -> String {
+    static func generateCodeVerifier() -> String? {
         var buffer = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, buffer.count, &buffer)
+        // Ensure the random bytes generation was successful
+        guard SecRandomCopyBytes(kSecRandomDefault, buffer.count, &buffer) == errSecSuccess else {
+            return nil
+        }
         return Data(buffer).base64URLEncodedString()
     }
 
@@ -1242,7 +1236,6 @@ struct PKCE {
         return Data(hashed).base64URLEncodedString()
     }
 }
-
 // Custom extension for base64URL encoding (RFC 4648)
 extension Data {
     func base64URLEncodedString() -> String {
@@ -1282,7 +1275,9 @@ struct SpotifyTokenStore: Codable {
 
     func save() {
         do {
-            let data = try JSONEncoder().encode(self)
+            var tokenToSave = self
+            tokenToSave.expirationDate = Date().addingTimeInterval(self.expiresIn)
+            let data = try JSONEncoder().encode(tokenToSave)
             try data.write(to: Self.fileURL, options: .atomicWrite)
             NSLog("💾 Token saved to \(Self.fileURL.path)")
         } catch {
