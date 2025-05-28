@@ -1,16 +1,16 @@
 import Cocoa
 import SpotifyWebAPI
 import CryptoKit
-import Security
+import Security // Keep Security for other potential uses, but not for direct Keychain token/key storage here
 
 // MARK: - Data Encryption Helper
 struct DataEncryptionHelper {
-    private let keychainService: String
-    private let keychainAccount: String
+    private let userDefaultsKey: String // Renamed for UserDefaults
+    private let keyStorageIdentifier: String
 
-    init(keychainService: String, keychainAccount: String) {
-        self.keychainService = keychainService
-        self.keychainAccount = keychainAccount
+    init(userDefaultsKey: String, keyStorageIdentifier: String) {
+        self.userDefaultsKey = userDefaultsKey
+        self.keyStorageIdentifier = keyStorageIdentifier
     }
 
     func encrypt(_ data: Data) -> Data? {
@@ -19,7 +19,7 @@ struct DataEncryptionHelper {
             let sealedBox = try AES.GCM.seal(data, using: key)
             return sealedBox.combined
         } catch {
-            NSLog("❌ [EncryptionHelper] Failed to encrypt data for service '\(keychainService)': \(error)")
+            NSLog("❌ [EncryptionHelper] Failed to encrypt data for '\(keyStorageIdentifier)': \(error)")
             return nil
         }
     }
@@ -31,66 +31,27 @@ struct DataEncryptionHelper {
             let decryptedData = try AES.GCM.open(sealedBox, using: key)
             return decryptedData
         } catch {
-            NSLog("❌ [EncryptionHelper] Failed to decrypt data for service '\(keychainService)': \(error). Data might be corrupt or key changed.")
+            NSLog("❌ [EncryptionHelper] Failed to decrypt data for '\(keyStorageIdentifier)': \(error). Data might be corrupt or key changed.")
             return nil
         }
     }
 
     func deleteKey() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        if status == errSecSuccess || status == errSecItemNotFound {
-            NSLog("🗑 Encryption key for service '\(keychainService)' deleted from Keychain.")
-        } else {
-            let errorMessage = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
-            NSLog("❌ Failed to delete encryption key for service '\(keychainService)': \(errorMessage) (Status: \(status))")
-        }
+        UserDefaults.standard.removeObject(forKey: userDefaultsKey)
+        NSLog("🗑 Encryption key for '\(keyStorageIdentifier)' deleted from UserDefaults.")
     }
 
     private func getEncryptionKey() -> SymmetricKey? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: kCFBooleanTrue!,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var dataTypeRef: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
-
-        if status == errSecSuccess {
-            if let retrievedData = dataTypeRef as? Data {
-                return SymmetricKey(data: retrievedData)
-            }
-        }
-        if status == errSecItemNotFound {
+        if let keyData = UserDefaults.standard.data(forKey: userDefaultsKey) {
+            NSLog("🔑 Encryption key for '\(keyStorageIdentifier)' loaded from UserDefaults.")
+            return SymmetricKey(data: keyData)
+        } else {
             let newKey = SymmetricKey(size: .bits256)
             let keyData = newKey.withUnsafeBytes { Data(Array($0)) }
-            let addQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: keychainService,
-                kSecAttrAccount as String: keychainAccount,
-                kSecValueData as String: keyData,
-                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            ]
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            if addStatus == errSecSuccess {
-                NSLog("🔑 New encryption key created and saved to Keychain for service '\(keychainService)'.")
-                return newKey
-            } else {
-                let errorMessage = SecCopyErrorMessageString(addStatus, nil) as String? ?? "Unknown error"
-                NSLog("❌ Failed to save new encryption key to Keychain for service '\(keychainService)': \(errorMessage) (Status: \(addStatus))")
-            }
+            UserDefaults.standard.set(keyData, forKey: userDefaultsKey)
+            NSLog("🔑 New encryption key created and saved to UserDefaults for '\(keyStorageIdentifier)'.")
+            return newKey
         }
-        if status != errSecSuccess && status != errSecItemNotFound {
-             let errorMessage = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
-             NSLog("❌ Unhandled error when loading encryption key for service '\(keychainService)': \(errorMessage) (Status: \(status))")
-        }
-        return nil
     }
 }
 
@@ -107,7 +68,8 @@ struct SpotifyTrack: Codable, Equatable, Hashable {
 // MARK: - Device Storage
 struct SpotifyDeviceStore: Codable {
     var id: String; var name: String
-    private static let encryptionHelper = DataEncryptionHelper(keychainService: "com.iqraamanuel.SpotifySwitcherClean.DeviceStoreKey", keychainAccount: "deviceStore")
+    // Updated encryptionHelper to use UserDefaults for key storage
+    private static let encryptionHelper = DataEncryptionHelper(userDefaultsKey: "com.iqraamanuel.SpotifySwitcherClean.DeviceStoreKey", keyStorageIdentifier: "deviceStore")
     private static let fileURL: URL = {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = appSupport.appendingPathComponent("SpotifyMenubarApp", isDirectory: true)
@@ -138,8 +100,12 @@ struct SpotifyTokenStore: Codable {
     let accessToken: String; var refreshToken: String?; let expirationDate: Date
     private let expiresIn: TimeInterval?
     var isExpired: Bool { return expirationDate < Date() }
-    private static let keychainService = "com.iqraamanuel.SpotifySwitcherClean.TokenService"
-    private static let keychainAccount = "spotifyUserToken"
+    
+    // NEW: UserDefaults key for token data
+    private static let userDefaultsTokenKey = "com.iqraamanuel.SpotifySwitcherClean.TokenData"
+    // NEW: Encryption helper for token data
+    private static let encryptionHelper = DataEncryptionHelper(userDefaultsKey: "com.iqraamanuel.SpotifySwitcherClean.TokenEncryptionKey", keyStorageIdentifier: "spotifyUserToken")
+
     private enum CodingKeys: String, CodingKey { case accessToken = "access_token", refreshToken = "refresh_token", expiresIn = "expires_in", expirationDate }
     
     init(from decoder: Decoder) throws {
@@ -168,33 +134,31 @@ struct SpotifyTokenStore: Codable {
     func save() {
         do {
             let tokenData = try JSONEncoder().encode(self)
-            var error: Unmanaged<CFError>?
-            let access = SecAccessControlCreateWithFlags(kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .applicationPassword, &error)
-            guard let accessControl = access else { NSLog("❌ Failed to create Keychain access control: \(error?.takeRetainedValue().localizedDescription ?? "Unknown error")"); return }
-            let query: [String: Any] = [ kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: SpotifyTokenStore.keychainService, kSecAttrAccount as String: SpotifyTokenStore.keychainAccount, kSecValueData as String: tokenData, kSecAttrAccessControl as String: accessControl ]
-            SecItemDelete(query as CFDictionary)
-            let status = SecItemAdd(query as CFDictionary, nil)
-            if status == errSecSuccess { NSLog("💾 Token saved to Keychain successfully (with .applicationPassword).") }
-            else { let err = SecCopyErrorMessageString(status, nil) as String?; NSLog("❌ Failed to save token to Keychain: \(err ?? "Unknown OSStatus") (Status: \(status))") }
-        } catch { NSLog("❌ Failed to encode token for Keychain storage: \(error)") }
+            guard let encryptedData = Self.encryptionHelper.encrypt(tokenData) else { NSLog("❌ Failed to encrypt token data for saving."); return }
+            UserDefaults.standard.set(encryptedData, forKey: Self.userDefaultsTokenKey)
+            NSLog("💾 Encrypted token data saved to UserDefaults.")
+        } catch { NSLog("❌ Failed to encode or save encrypted token to UserDefaults: \(error)") }
     }
     static func load() -> SpotifyTokenStore? {
-        let query: [String: Any] = [ kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: keychainAccount, kSecReturnData as String: kCFBooleanTrue!, kSecMatchLimit as String: kSecMatchLimitOne ]
-        var dataTypeRef: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
-        if status == errSecSuccess {
-            guard let retrievedData = dataTypeRef as? Data else { return nil }
-            do { let tokenStore = try JSONDecoder().decode(SpotifyTokenStore.self, from: retrievedData); NSLog("✅ Token loaded from Keychain."); return tokenStore }
-            catch { NSLog("❌ Failed to decode token from Keychain: \(error). Deleting corrupt item."); delete(); return nil }
-        } else if status == errSecItemNotFound { NSLog("ℹ️ No token found in Keychain for service '\(keychainService)'.")
-        } else { let err = SecCopyErrorMessageString(status, nil) as String?; NSLog("❌ Error loading token from Keychain: \(err ?? "Unknown OSStatus") (Status: \(status))") }
-        return nil
+        guard let encryptedData = UserDefaults.standard.data(forKey: Self.userDefaultsTokenKey) else {
+            NSLog("ℹ️ No encrypted token data found in UserDefaults.")
+            return nil
+        }
+        guard let decryptedData = encryptionHelper.decrypt(encryptedData) else {
+            NSLog("❌ Failed to decrypt token data from UserDefaults. Deleting corrupt item."); delete(); return nil
+        }
+        do {
+            let tokenStore = try JSONDecoder().decode(SpotifyTokenStore.self, from: decryptedData)
+            NSLog("✅ Token loaded and decrypted from UserDefaults.")
+            return tokenStore
+        } catch {
+            NSLog("❌ Failed to decode token from decrypted data: \(error). Deleting corrupt item."); delete(); return nil
+        }
     }
     static func delete() {
-        let query: [String: Any] = [ kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: keychainAccount ]
-        let status = SecItemDelete(query as CFDictionary)
-        if status == errSecSuccess || status == errSecItemNotFound { NSLog("🗑 Token deleted from Keychain.") }
-        else { let err = SecCopyErrorMessageString(status, nil) as String?; NSLog("❌ Failed to delete token from Keychain: \(err ?? "Unknown OSStatus") (Status: \(status))") }
+        UserDefaults.standard.removeObject(forKey: Self.userDefaultsTokenKey)
+        encryptionHelper.deleteKey() // Also delete the encryption key
+        NSLog("🗑 Encrypted token data and key deleted from UserDefaults.")
     }
 }
 
@@ -242,7 +206,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let historyMenuItemIdentifier = NSUserInterfaceItemIdentifier("historyMenuItem")
     private let historySeparatorIdentifier = NSUserInterfaceItemIdentifier("historySeparator")
     
-    private let recentTracksEncryptionHelper = DataEncryptionHelper(keychainService: "com.iqraamanuel.SpotifySwitcherClean.RecentTracksKey", keychainAccount: "recentTracks")
+    // Updated encryptionHelper to use UserDefaults for key storage
+    private let recentTracksEncryptionHelper = DataEncryptionHelper(userDefaultsKey: "com.iqraamanuel.SpotifySwitcherClean.RecentTracksKey", keyStorageIdentifier: "recentTracks")
     
     override init() { super.init() }
     
@@ -258,22 +223,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         updateUI(for: .loading)
 
+        // --- MODIFIED: Initial token loading and error handling ---
         if let storedToken = SpotifyTokenStore.load() {
             self.tokenStore = storedToken
             if storedToken.isExpired {
+                NSLog("🔑 Stored token expired, attempting refresh.")
                 refreshAccessToken()
             } else {
-                authorizeMenuItem?.isHidden = true
-                updateAllData()
-                startDataUpdateTimer()
+                NSLog("🔑 Stored token found and is valid. Attempting initial data update.")
+                // Start data update immediately to check token validity with Spotify API
+                checkTokenValidityAndFetchInitialData()
             }
         } else {
+            NSLog("🔑 No stored token found. Showing authorize option.")
             authorizeMenuItem?.isHidden = false
             miniPlayerMenuItem?.isHidden = true
             updateUI(for: .notPlaying(message: "Authorize"))
         }
+        // --- END MODIFIED ---
     }
-    
+
+    // --- NEW: Function to check token validity with an API call on launch ---
+    private func checkTokenValidityAndFetchInitialData() {
+        guard let token = tokenStore else {
+            DispatchQueue.main.async {
+                self.authorizeMenuItem?.isHidden = false
+                self.miniPlayerMenuItem?.isHidden = true
+                self.updateUI(for: .notPlaying(message: "Authorize"))
+            }
+            return
+        }
+
+        NSLog("📡 Checking token validity by fetching current playback state...")
+        var request = URLRequest(url: URL(string: "https://api.spotify.com/v1/me/player")!) // Use a common endpoint like current playback
+        request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+
+            if let httpResponse = response as? HTTPURLResponse {
+                if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                    NSLog("‼️ Initial token check failed with HTTP \(httpResponse.statusCode). Forcing re-authorization.")
+                    DispatchQueue.main.async {
+                        self.resetAuthorizationInternal() // Perform the full reset
+                        self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                    }
+                    return
+                }
+            }
+
+            // If we got here, the token is likely good, or the error wasn't 401/403 requiring a full reset
+            DispatchQueue.main.async {
+                self.authorizeMenuItem?.isHidden = true
+                self.updateAllData()
+                self.startDataUpdateTimer()
+            }
+        }.resume()
+    }
+    // --- END NEW ---
+
     func startDataUpdateTimer() {
         dataUpdateTimer?.invalidate()
         dataUpdateTimer = Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(updateAllDataWrapper), userInfo: nil, repeats: true) // Increased interval
@@ -296,7 +304,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         authorizeMenuItem = NSMenuItem(title: "Authorize Spotify", action: #selector(authorizeSpotify), keyEquivalent: "")
         menu.addItem(authorizeMenuItem!)
         
-        menu.addItem(NSMenuItem(title: "Reset Authorization", action: #selector(resetAuthorization), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Reset Authorization", action: #selector(resetAuthorizationExternal), keyEquivalent: "")) // Renamed for clarity
         menu.addItem(NSMenuItem.separator())
         
         addToPlaylistMenuItem = NSMenuItem(title: "Add song to playlist...", action: nil, keyEquivalent: "")
@@ -401,6 +409,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             historySubmenu.addItem(item)
         }
+        historySubmenu.addItem(NSMenuItem.separator())
+        let clearHistoryItem = NSMenuItem(title: "Clear History", action: #selector(clearRecentTracks), keyEquivalent: "")
+        historySubmenu.addItem(clearHistoryItem)
+
         historyMenuItem.submenu = historySubmenu
 
         var insertionPoint = menu.items.count - 1
@@ -412,6 +424,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         separator.identifier = historySeparatorIdentifier
         menu.insertItem(separator, at: insertionPoint)
         menu.insertItem(historyMenuItem, at: insertionPoint + 1)
+    }
+
+    @objc func clearRecentTracks() {
+        self.recentTracks = []
+        self.deleteRecentTracks()
+        DispatchQueue.main.async { self.updateHistoryMenu(excluding: nil) }
+        NSLog("🗑 Recent tracks cleared from memory and disk.")
     }
     
     @objc func playTrackFromHistory(_ sender: NSMenuItem) {
@@ -438,9 +457,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.authorizeMenuItem?.isHidden = isAuthorized
             
             // These should remain visible even if rate-limited, as per user request.
-            self.addToPlaylistMenuItem?.isHidden = false
-            self.transferMenuItem?.isHidden = false
-            self.miniPlayerMenuItem?.isHidden = false
+            // However, if not authorized, hide them.
+            self.addToPlaylistMenuItem?.isHidden = !isAuthorized
+            self.transferMenuItem?.isHidden = !isAuthorized
+            self.miniPlayerMenuItem?.isHidden = !isAuthorized
 
             var currentTrackURI: String? = nil // Declare currentTrackURI here
 
@@ -467,7 +487,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if isAuthorized {
                         self.miniPlayerView?.update(isPlaying: false, shuffleState: false, repeatState: "off", isLiked: false, volume: 50)
                     } else {
-                        self.miniPlayerMenuItem?.isHidden = true
+                        self.miniPlayerMenuItem?.isHidden = true // Ensure mini player is hidden if not authorized
                     }
 
                 case .error(let message):
@@ -594,7 +614,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let error = error { self.updateUI(for: .error(message: "Network: \(error.localizedDescription.prefix(20))")); return }
             guard let httpResponse = response as? HTTPURLResponse else { self.updateUI(for: .error(message: "Server Error")); return }
 
-            if httpResponse.statusCode == 401 { self.refreshAccessToken(); return }
+            // --- MODIFIED: Handle 401/403 for current track details ---
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                NSLog("‼️ Current Track API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                DispatchQueue.main.async {
+                    self.resetAuthorizationInternal() // Trigger full reset
+                    self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                }
+                return
+            }
+            // --- END MODIFIED ---
+
             if httpResponse.statusCode == 204 || data == nil { self.updateUI(for: .notPlaying(message: "Nothing Playing")); return }
             if httpResponse.statusCode == 429 {
                 NSLog("‼️ Rate limit hit on fetchCurrentTrackDetails. Pausing timer.");
@@ -670,6 +700,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.lastSeenTrackURI = uri
                     } else if let index = self.recentTracks.firstIndex(where: { $0.id == id }) {
                         self.recentTracks[index].isLiked = playbackContext.isLiked
+                        self.saveRecentTracks() // Save updated liked status
                     }
                     self.updateUI(for: .playing(track: currentTrack, context: playbackContext, art: albumArtForStatusBar))
                 }
@@ -695,6 +726,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let error = error { NSLog("❌ Recently Played Network Error: \(error.localizedDescription)"); return }
             guard let httpResponse = response as? HTTPURLResponse else { NSLog("❌ Recently Played: Invalid response."); return }
             
+            // --- MODIFIED: Handle 401/403 for recently played ---
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                NSLog("‼️ Recently Played API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                DispatchQueue.main.async {
+                    self.resetAuthorizationInternal() // Trigger full reset
+                    self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                }
+                return
+            }
+            // --- END MODIFIED ---
+
             if httpResponse.statusCode == 429 {
                 NSLog("‼️ Rate limit hit on fetchRecentlyPlayed.");
                 self.isRateLimited = true // Set the flag for the persistent menu item
@@ -826,7 +868,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
           let params = [ "client_id": clientId, "grant_type": "authorization_code", "code": code, "redirect_uri": redirectURI, "code_verifier": verifier ]
           request.httpBody = params.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")" }.joined(separator: "&").data(using: .utf8)
           URLSession.shared.dataTask(with: request) { data, response, error in
-              guard let data = data, error == nil else { self.updateUI(for: .error(message: "Auth Failed")); return }
+              guard let data = data, error == nil else { self.updateUI(for: .error(message: "Auth Failed - Network/Unknown Error")); return }
+
+              if let httpResponse = response as? HTTPURLResponse {
+                  // --- MODIFIED: Handle 400 for explicit re-auth ---
+                  if httpResponse.statusCode == 400 || httpResponse.statusCode == 403 { // Treat 403 during token exchange as needing re-auth
+                      NSLog("🔑 Auth error during code exchange (\(httpResponse.statusCode)). Deleting token and requiring re-auth.")
+                      self.resetAuthorizationInternal() // Full reset
+                      DispatchQueue.main.async {
+                          self.updateUI(for: .notPlaying(message: "Re-authorize"))
+                      }
+                      return
+                  }
+                  // --- END MODIFIED ---
+                  if httpResponse.statusCode == 429 { // Handle rate limit for token exchange
+                      NSLog("‼️ Rate limit hit on exchangeCodeForToken.")
+                      self.isRateLimited = true
+                      DispatchQueue.main.async { self.showRateLimitedStatusTemporarily() }
+                      return
+                  }
+                  guard (200...299).contains(httpResponse.statusCode) else {
+                      self.updateUI(for: .error(message: "Auth Failed - HTTP \(httpResponse.statusCode)"))
+                      return
+                  }
+              }
+              
               do {
                   let tokenDataFromAPI = try JSONDecoder().decode(SpotifyTokenStore.self, from: data)
                   tokenDataFromAPI.save()
@@ -854,9 +920,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
                 guard let self = self else { return }
                 guard let data = data, error == nil else { self.handleTokenRefreshFailure(); return }
-                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 400 {
-                     self.handleTokenRefreshFailure(isAuthError: true); return
+
+                // --- MODIFIED: Handle 400/403 for refresh token ---
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 400 || httpResponse.statusCode == 403 {
+                     NSLog("🔑 Auth error during token refresh (\(httpResponse.statusCode)). Deleting token and requiring re-auth.")
+                     self.resetAuthorizationInternal(immediate: true) // Full reset and immediate UI update
+                     return
                 }
+                // --- END MODIFIED ---
+
                 if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 429 { // Added rate limit handling
                     NSLog("‼️ Rate limit hit on refreshAccessToken.")
                     self.isRateLimited = true // Set the flag for the persistent menu item
@@ -879,31 +951,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     func handleTokenRefreshFailure(isAuthError: Bool = false) {
         if isAuthError {
-            NSLog("🔑 Auth error during token refresh. Deleting token and requiring re-auth.")
-            SpotifyTokenStore.delete()
-            self.tokenStore = nil
-            DispatchQueue.main.async {
-                self.authorizeMenuItem?.isHidden = false
-                self.miniPlayerMenuItem?.isHidden = true
-                self.updateUI(for: .notPlaying(message: "Re-authorize"))
-            }
+            NSLog("🔑 Auth error during token refresh (e.g., bad refresh token). Deleting token and requiring re-auth.")
+            resetAuthorizationInternal(immediate: true) // Force full reset and immediate UI update
         } else {
-            NSLog("🔑 Non-auth token refresh failure (e.g., network).")
+            NSLog("🔑 Non-auth token refresh failure (e.g., network, decode error).")
             DispatchQueue.main.async { self.updateUI(for: .error(message: "Auth Refresh Failed")) }
         }
     }
     
-    @objc func resetAuthorization() {
-        NSLog("🗑 Resetting all authorization and user data.")
+    @objc func resetAuthorizationExternal() { // Called by menu item
+        NSLog("🗑 User initiated reset of all authorization and user data.")
+        resetAuthorizationInternal()
+    }
+
+    // --- NEW: Internal function for resetting authorization, allowing immediate UI update ---
+    private func resetAuthorizationInternal(immediate: Bool = false) {
         SpotifyTokenStore.delete(); SpotifyDeviceStore.delete(); deleteRecentTracks()
         self.tokenStore = nil; self.preferredDevice = nil; self.recentTracks = []; self.codeVerifier = nil
-        DispatchQueue.main.async {
-            self.authorizeMenuItem?.isHidden = false
-            self.miniPlayerMenuItem?.isHidden = true
-            self.updateUI(for: .notPlaying(message: "Authorize"))
-            self.updateHistoryMenu(excluding: nil)
+        self.dataUpdateTimer?.invalidate() // Stop timer immediately
+
+        if immediate {
+            DispatchQueue.main.async {
+                self.authorizeMenuItem?.isHidden = false
+                self.miniPlayerMenuItem?.isHidden = true
+                self.updateUI(for: .notPlaying(message: "Authorize"))
+                self.updateHistoryMenu(excluding: nil)
+            }
+        } else {
+            DispatchQueue.main.async {
+                self.authorizeMenuItem?.isHidden = false
+                self.miniPlayerMenuItem?.isHidden = true
+                self.updateUI(for: .notPlaying(message: "Authorize"))
+                self.updateHistoryMenu(excluding: nil)
+            }
         }
     }
+    // --- END NEW ---
 
     @objc func quitApp() { NSApp.terminate(nil) }
 
@@ -945,6 +1028,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     NSLog("❌ Invalid response checking liked status for chunk. Response: \(String(describing: response))")
                     return
                 }
+                // --- MODIFIED: Handle 401/403 for liked status ---
+                if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                    NSLog("‼️ Liked Status API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                    DispatchQueue.main.async {
+                        self.resetAuthorizationInternal() // Trigger full reset
+                        self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                    }
+                    return
+                }
+                // --- END MODIFIED ---
                 if httpResponse.statusCode == 429 {
                     NSLog("‼️ Rate limit hit on checkIfTracksAreLiked. (Chunk: \(idsString))")
                     self.isRateLimited = true // Set the flag for the persistent menu item
@@ -987,6 +1080,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let error = error { NSLog("❌ Error toggling like status for track \(track.id): \(error.localizedDescription)"); return }
             guard let httpResponse = response as? HTTPURLResponse else { NSLog("❌ Invalid response when toggling like status for track \(track.id)."); return }
             
+            // --- MODIFIED: Handle 401/403 for toggle like status ---
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                NSLog("‼️ Toggle Like API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                DispatchQueue.main.async {
+                    self.resetAuthorizationInternal() // Trigger full reset
+                    self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                }
+                return
+            }
+            // --- END MODIFIED ---
+
             if httpResponse.statusCode == 429 {
                 NSLog("‼️ Rate limit hit on toggleLikeStatus.")
                 self.isRateLimited = true // Set the flag for the persistent menu item
@@ -1016,6 +1120,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let data = data, let httpResponse = response as? HTTPURLResponse else {
                 self.updatePlaylistsSubmenu(with: .failure(NSError(domain: "SpotifyApp", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch playlists."]))); return
             }
+
+            // --- MODIFIED: Handle 401/403 for playlists ---
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                NSLog("‼️ Playlists API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                DispatchQueue.main.async {
+                    self.resetAuthorizationInternal() // Trigger full reset
+                    self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                }
+                return
+            }
+            // --- END MODIFIED ---
 
             if httpResponse.statusCode == 429 { // Added rate limit handling
                 NSLog("‼️ Rate limit hit on fetchUserPlaylists.")
@@ -1071,6 +1186,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self else { return }
             DispatchQueue.main.async {
                 if let httpResponse = response as? HTTPURLResponse {
+                    // --- MODIFIED: Handle 401/403 for add to playlist ---
+                    if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                        NSLog("‼️ Add to Playlist API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                        self.resetAuthorizationInternal() // Trigger full reset
+                        self.showErrorAlert(title: "Authorization Required", message: "Please re-authorize Spotify to add to playlists.")
+                        return
+                    }
+                    // --- END MODIFIED ---
+
                     if httpResponse.statusCode == 429 {
                         NSLog("‼️ Rate limit hit on addCurrentSongToSelectedPlaylist.")
                         self.isRateLimited = true // Set the flag for the persistent menu item
@@ -1093,6 +1217,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self else { return }
             DispatchQueue.main.async {
                 if let httpResponse = response as? HTTPURLResponse {
+                    // --- MODIFIED: Handle 401/403 for device transfer ---
+                    if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                        NSLog("‼️ Device Transfer API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                        self.resetAuthorizationInternal() // Trigger full reset
+                        self.showErrorAlert(title: "Authorization Required", message: "Please re-authorize Spotify to transfer playback.")
+                        return
+                    }
+                    // --- END MODIFIED ---
+
                     if httpResponse.statusCode == 429 {
                         NSLog("‼️ Rate limit hit on promptForDeviceTransfer.")
                         self.isRateLimited = true // Set the flag for the persistent menu item
@@ -1135,6 +1268,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self else { return }
             DispatchQueue.main.async {
                 if let httpResponse = response as? HTTPURLResponse {
+                    // --- MODIFIED: Handle 401/403 for transfer playback ---
+                    if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                        NSLog("‼️ Transfer Playback API returned \(httpResponse.statusCode). Forcing re-authorization.")
+                        self.resetAuthorizationInternal() // Trigger full reset
+                        self.showErrorAlert(title: "Authorization Required", message: "Please re-authorize Spotify to transfer playback.")
+                        return
+                    }
+                    // --- END MODIFIED ---
+
                     if httpResponse.statusCode == 429 {
                         NSLog("‼️ Rate limit hit on transferPlaybackToSelectedDevice.")
                         self.isRateLimited = true // Set the flag for the persistent menu item
@@ -1227,6 +1369,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self = self else { return }
             if let error = error { NSLog("❌ Player action '\(endpoint)' network error: \(error.localizedDescription)"); return }
             guard let httpResponse = response as? HTTPURLResponse else { NSLog("❌ Player action '\(endpoint)' invalid response."); return }
+
+            // --- MODIFIED: Handle 401/403 for player actions ---
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                NSLog("‼️ Player action '\(endpoint)' returned \(httpResponse.statusCode). Forcing re-authorization.")
+                DispatchQueue.main.async {
+                    self.resetAuthorizationInternal() // Trigger full reset
+                    self.updateUI(for: .notPlaying(message: "Re-authorize Required"))
+                }
+                return
+            }
+            // --- END MODIFIED ---
 
             if httpResponse.statusCode == 429 {
                 NSLog("‼️ Rate limit hit on player action '\(endpoint)'.")
