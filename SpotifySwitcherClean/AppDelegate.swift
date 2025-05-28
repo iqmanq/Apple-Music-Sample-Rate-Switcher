@@ -284,8 +284,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func startDataUpdateTimer() {
         dataUpdateTimer?.invalidate()
-        dataUpdateTimer = Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(updateAllDataWrapper), userInfo: nil, repeats: true) // Increased interval
-        NSLog("🕰️ Data update timer started (15s interval).")
+        dataUpdateTimer = Timer.scheduledTimer(timeInterval: 10, target: self, selector: #selector(updateAllDataWrapper), userInfo: nil, repeats: true) // Decreased interval
+        NSLog("🕰️ Data update timer started (10s interval).")
     }
 
     func setupMenu() {
@@ -1100,7 +1100,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             if (200...299).contains(httpResponse.statusCode) {
                 NSLog("✅ Like status toggled successfully for track \(track.id). Status: \(httpResponse.statusCode)")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.updateAllData() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0) { self.updateAllData() }
             } else {
                 NSLog("❌ Failed to toggle like status for track \(track.id). Code: \(httpResponse.statusCode)")
                 if let responseData = data, let errorBody = String(data: responseData, encoding: .utf8) { NSLog("❌ Spotify Error Body: \(errorBody)") }
@@ -1391,7 +1391,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if (200...299).contains(httpResponse.statusCode) {
                 NSLog("✅ Player action '\(endpoint)' successful. Code: \(httpResponse.statusCode)")
                 if immediateUpdate {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { self.updateAllData() }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0) { self.updateAllData() }
                 }
             } else { NSLog("❌ Player action '\(endpoint)' failed. Code: \(httpResponse.statusCode)") }
         }.resume()

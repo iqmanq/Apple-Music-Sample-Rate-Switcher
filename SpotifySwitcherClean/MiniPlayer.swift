@@ -108,6 +108,7 @@ class MiniPlayerView: NSView {
     }
     
     func update(isPlaying: Bool, shuffleState: Bool, repeatState: String, isLiked: Bool, volume: Int) {
+        // Play/Pause button
         let playPauseSymbolName = isPlaying ? "pause.fill" : "play.fill"
         if let symbolImage = NSImage(systemSymbolName: playPauseSymbolName, accessibilityDescription: isPlaying ? "Pause" : "Play") {
             let templateImage = symbolImage.copy() as! NSImage
@@ -116,16 +117,40 @@ class MiniPlayerView: NSView {
         }
         playPauseButton.contentTintColor = NSColor.white
 
+        // Shuffle Button
+        let shuffleSymbolName = shuffleState ? "shuffle.circle.fill" : "shuffle"
+        if let symbolImage = NSImage(systemSymbolName: shuffleSymbolName, accessibilityDescription: "Shuffle") {
+            let templateImage = symbolImage.copy() as! NSImage
+            templateImage.isTemplate = true
+            shuffleButton.image = templateImage
+        }
         shuffleButton.contentTintColor = shuffleState ? NSColor.systemGreen : NSColor.white
-        
-        let repeatSymbolName = repeatState == "track" ? "repeat.1" : "repeat"
+        shuffleButton.toolTip = shuffleState ? "Shuffle On" : "Shuffle Off"
+
+        // Repeat Button
+        let repeatSymbolName: String
+        let repeatToolTip: String
+        switch repeatState {
+        case "track":
+            repeatSymbolName = "repeat.1"
+            repeatToolTip = "Repeat Single"
+        case "context":
+            repeatSymbolName = "repeat.circle.fill"
+            repeatToolTip = "Repeat All"
+        default:
+            repeatSymbolName = "repeat"
+            repeatToolTip = "Repeat Off"
+        }
+
         if let symbolImage = NSImage(systemSymbolName: repeatSymbolName, accessibilityDescription: "Repeat") {
              let templateImage = symbolImage.copy() as! NSImage
             templateImage.isTemplate = true
             repeatButton.image = templateImage
         }
         repeatButton.contentTintColor = (repeatState == "off") ? NSColor.white : NSColor.systemGreen
+        repeatButton.toolTip = repeatToolTip
         
+        // Like Button
         let likeSymbolName = isLiked ? "heart.fill" : "heart"
         if let symbolImage = NSImage(systemSymbolName: likeSymbolName, accessibilityDescription: isLiked ? "Unlike" : "Like") {
             let templateImage = symbolImage.copy() as! NSImage
@@ -135,6 +160,7 @@ class MiniPlayerView: NSView {
         likeButton.contentTintColor = isLiked ? NSColor.systemGreen : NSColor.white
         likeButton.toolTip = isLiked ? "Unlike" : "Like"
 
+        // Volume Slider
         if !volumeSlider.isHighlighted {
              volumeSlider.integerValue = volume
         }
